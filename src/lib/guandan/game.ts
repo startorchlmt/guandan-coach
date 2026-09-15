@@ -102,9 +102,10 @@ export class GuandanHand {
     let leadSeat = head; // 抗贡时头游领出
 
     if (!resisted) {
-      // 先抽各贡方的最大牌
+      // 先抽各贡方的最大牌（红桃级牌=逢人配可免贡，往下找其他大牌）
       const tributes = givers.map((giver) => {
-        const card = maxCard(this.hands[giver], this.level);
+        const pool = this.hands[giver].filter((c) => !(c.suit === 1 && c.rank === this.level));
+        const card = maxCard(pool.length > 0 ? pool : this.hands[giver], this.level);
         this.hands[giver] = this.hands[giver].filter((c) => c.id !== card.id);
         return { giver, card, receiver: order[0] };
       });
@@ -139,9 +140,9 @@ export class GuandanHand {
     this.currentSeat = leadSeat;
   }
 
-  /** 还贡候选：点数 ≤10 的牌 */
+  /** 还贡候选：点数 ≤10 且非级牌（王牌、级牌都不可还） */
   returnCandidates(seat: number): Card[] {
-    const cands = this.hands[seat].filter((c) => c.suit !== -1 && c.rank <= 10);
+    const cands = this.hands[seat].filter((c) => c.suit !== -1 && c.rank <= 10 && c.rank !== this.level);
     return cands.length > 0 ? cands : [...this.hands[seat]];
   }
 
@@ -150,12 +151,14 @@ export class GuandanHand {
     return sortCards(cands, this.level)[0]; // 还最小的
   }
 
-  /** 玩家还贡 */
+  /** 玩家还贡（必须是合法候选：≤10 且非级牌；无候选时才放开） */
   playerReturn(cardId: number): boolean {
     if (this.phase !== 'tribute-return' || !this.tribute) return false;
     const seat = 0;
     const card = this.hands[seat].find((c) => c.id === cardId);
     if (!card) return false;
+    const strict = this.hands[seat].some((c) => c.suit !== -1 && c.rank <= 10 && c.rank !== this.level);
+    if (strict && (card.suit === -1 || card.rank > 10 || card.rank === this.level)) return false;
     const giver = this.tribute.pairs.find((p) => p.receiver === seat)?.giver;
     if (giver === undefined) return false;
     this.hands[seat] = this.hands[seat].filter((c) => c.id !== cardId);

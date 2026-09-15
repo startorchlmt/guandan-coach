@@ -828,6 +828,47 @@ t(137, '剩两单张：对手剩1张先出大，对手牌多先出小', () => {
   assert.ok(d5.play && d5.play.cards[0].rank === 6, `对手牌还多应先出小单探路，实际: ${d5.play?.cards.map(cardLabel).join(' ')}`);
 });
 
+t(138, '进贡碰到红桃级牌可免贡，往下找其他大牌', () => {
+  // 不变量：任何进贡牌都不得是红桃级牌（逢人配）
+  const prev: HandResult = { order: [0, 1, 2, 3], myTeamDelta: 1, headSeat: 0, doubleDown: false };
+  let tributes = 0;
+  for (let seed = 600; seed < 650; seed++) {
+    const g = new GuandanHand(seed, 6, prev);
+    const tr = g.tribute!;
+    if (tr.resisted) continue;
+    for (const [, card] of tr.given) {
+      tributes++;
+      assert.ok(!(card.suit === 1 && card.rank === 6), `进贡不得包含红桃级牌，实际贡了 ${cardLabel(card)}`);
+    }
+  }
+  assert.ok(tributes > 10, '应有足够进贡样本');
+});
+
+t(139, '还贡不能还级牌（≤10 的级牌也不行）', () => {
+  const prev: HandResult = { order: [0, 1, 2, 3], myTeamDelta: 1, headSeat: 0, doubleDown: false };
+  let tested = false;
+  for (let seed = 500; seed < 580 && !tested; seed++) {
+    const g = new GuandanHand(seed, 6, prev);
+    if (g.phase !== 'tribute-return') continue; // 抗贡局
+    const lvl = g.hands[0].find((c) => c.rank === 6);
+    const cands = g.returnCandidates(0);
+    assert.ok(!cands.some((c) => c.rank === 6), '还贡候选里不能有级牌');
+    if (lvl) {
+      assert.equal(g.playerReturn(lvl.id), false, `级牌 ${cardLabel(lvl)} 不可还贡`);
+      tested = true;
+    }
+  }
+  assert.ok(tested, '应找到手里含级牌的还贡样本');
+});
+
+t(140, 'AI 开局不浪费级牌三带二', () => {
+  // 打5：手握 55599 三带二材料 + 一堆小牌，开局领出不该甩级牌
+  const hand = handOf([5, 0], [5, 2], [5, 3], [9], [9, 1], [3], [4], [6], [7], [8], [10], [12], [13]);
+  const d = decide({ seat: 0, hand, level: 5, toBeat: null, trickWinner: null, partner: 2, oppMinCards: 27, partnerCards: 27 });
+  assert.ok(d.play, '应有领出方案');
+  assert.ok(!d.play!.cards.some((c) => c.rank === 5), `开局不应动级牌，实际: ${d.play!.cards.map(cardLabel).join(' ')}`);
+});
+
 // ---------- 汇总 ----------
 console.log(`\n通过 ${passed}/${total}`);
 if (failures.length > 0) {

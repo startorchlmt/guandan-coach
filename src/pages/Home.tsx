@@ -250,25 +250,6 @@ export default function Home() {
   const tracker = game ? trackCards(game, level) : []
   const opening = game && showOpening ? openingReview(game.hands[0], level) : null
 
-  // 进贡/还贡信息（本手开局时展示）
-  const tributeLines: string[] = []
-  if (game?.tribute && game.turn === 0) {
-    const t = game.tribute
-    if (t.resisted) {
-      tributeLines.push('💪 败方合计持有两张大王——抗贡成功，本手免贡！')
-    } else {
-      for (const p of t.pairs) {
-        const given = t.given.get(p.giver)
-        const back = t.returned.get(p.receiver)
-        tributeLines.push(
-          `🎁 ${seatName(p.giver)} 向 ${seatName(p.receiver)} 进贡 ${given ? cardLabel(given) : ''}` +
-          (back ? `，还贡 ${cardLabel(back)}` : p.receiver === 0 ? '，等待你还贡…' : ''),
-        )
-      }
-      if (t.double) tributeLines.push('（双下双贡）')
-    }
-  }
-
   // ---------- 战报海报 ----------
   const posterRef = useRef<HTMLCanvasElement | null>(null)
   const drawPoster = () => {
@@ -375,12 +356,34 @@ export default function Home() {
                   <div />
                   <SeatRow seat={3} game={game} lastPlayView={lastPlayView} />
                   <div className="rounded-lg bg-neutral-900/70 p-3 text-center text-sm min-w-[150px] sm:min-w-[220px]">
-                    {tributeLines.length > 0 && (
-                      <div className="mb-1 space-y-0.5">
-                        {tributeLines.map((l, i) => <p key={i} className="text-violet-300">{l}</p>)}
+                    {game.tribute && (
+                      <div className="mb-2 space-y-1.5">
+                        {game.tribute.resisted ? (
+                          <p className="text-violet-300">💪 败方合计持有两张大王——抗贡成功，本手免贡！</p>
+                        ) : (
+                          game.tribute.pairs.map((p, i) => {
+                            const given = game.tribute!.given.get(p.giver)
+                            const back = game.tribute!.returned.get(p.receiver)
+                            return (
+                              <div key={i} className="flex flex-wrap items-center justify-center gap-1 text-xs text-violet-200">
+                                <span className="font-medium">{seatName(p.giver)}</span>
+                                <span className="text-neutral-400">贡</span>
+                                {given && <CardView c={given} small wild={given.suit === 1 && given.rank === level} />}
+                                <span className="text-neutral-400">→ {seatName(p.receiver)}</span>
+                                <span className="mx-1 text-neutral-600">｜</span>
+                                <span className="text-neutral-400">还</span>
+                                {back
+                                  ? <CardView c={back} small wild={back.suit === 1 && back.rank === level} />
+                                  : <span className="text-amber-300">等待中…</span>}
+                                <span className="text-neutral-400">→ {seatName(p.giver)}</span>
+                              </div>
+                            )
+                          })
+                        )}
+                        {game.tribute.double && !game.tribute.resisted && <p className="text-[10px] text-neutral-500">双下双贡：头游拿大、二游拿小，贡大牌者先出</p>}
                       </div>
                     )}
-                    {game.phase === 'tribute-return' && <p className="text-amber-300">进贡完成，请选择一张牌还贡（≤10 的牌）</p>}
+                    {game.phase === 'tribute-return' && <p className="text-amber-300">进贡完成，请选择一张牌还贡（≤10 的非级牌）</p>}
                     {game.phase === 'play' && (
                       <p>
                         轮到 <span className="font-bold text-amber-300">{seatName(game.currentSeat)}</span>
@@ -418,7 +421,11 @@ export default function Home() {
                   )}
                   {(() => {
                     const hand = sortedHand(game.hands[0])
-                    const canPick = game.phase === 'tribute-return' || isMyTurn
+                    // 还贡阶段只能选合法候选（≤10 且非级牌；实在没有才全放开）
+                    const returnIds = game.phase === 'tribute-return'
+                      ? new Set(game.returnCandidates(0).map((c) => c.id))
+                      : null
+                    const canPick = (c: Card) => (returnIds ? returnIds.has(c.id) : isMyTurn)
                     const renderCard = (c: Card, extra = '') => (
                       <span key={c.id}
                         draggable={game.phase === 'tribute-return' || isMyTurn || game.phase === 'play'}
@@ -428,7 +435,7 @@ export default function Home() {
                         className={`inline-block ${extra}`}>
                         <CardView c={c} selected={selected.has(c.id)}
                           wild={c.suit === 1 && c.rank === level}
-                          onClick={canPick ? () => toggleCard(c) : undefined} />
+                          onClick={canPick(c) ? () => toggleCard(c) : undefined} />
                       </span>
                     )
                     if (!customOrder && sortMode === 'stack') {
@@ -454,6 +461,7 @@ export default function Home() {
                       <Button disabled={selected.size !== 1} onClick={() => {
                         const id = [...selected][0]
                         if (game.playerReturn(id)) { setSelected(new Set()); bump() }
+                        else toast.error('还贡需选 ≤10 的非级牌')
                       }}>还贡这张牌</Button>
                     ) : (
                       <>

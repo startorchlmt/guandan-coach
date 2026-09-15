@@ -355,6 +355,16 @@ export function decide(ctx: AiContext): AiDecision {
       if (hand.length <= 6) s += p.cards.length * 0.8; // 残局快走
       // 前期不轻易亮大牌/百搭：手牌多时每点高位扣额外分
       if (hand.length > 12) s -= Math.max(0, cmpRank(p.mainRank, level) - 11) * 0.3;
+      // 开局重手克制：手牌充足时动级牌是大浪费——级牌三同/三带二/钢板重罚，其他组合用级牌也扣分
+      if (hand.length > 12 && !isBombType(p.type)) {
+        const lvlUsed = p.cards.filter((c) => c.rank === level).length;
+        if (lvlUsed > 0) {
+          if ((p.type === 'triple' || p.type === 'fullhouse' || p.type === 'tripleseq') && p.mainRank === level) s -= 6;
+          else s -= lvlUsed * 1.5;
+        }
+        // 同理，A/K 级的中高三同/三带二开局也别急着甩
+        if ((p.type === 'triple' || p.type === 'fullhouse') && p.mainRank !== level && cmpRank(p.mainRank, level) >= 13) s -= 2;
+      }
       // 剩 2 张的残局：根据对手余牌灵活决定先大还是先小
       if (hand.length === 2) {
         const om = ctx.oppMinCards;
