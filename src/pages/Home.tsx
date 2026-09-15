@@ -13,7 +13,7 @@ import { cardLabel, RANK_LABELS, sortCards } from '@/lib/guandan/cards.ts'
 import { GuandanHand, newMatch, advanceMatch, handLevel, seatName, type MatchState, type HandResult } from '@/lib/guandan/game.ts'
 import { recommend, evaluate, review, QUIZ, quizBonus, CHAT_CHIPS, coachChat, openingReview, type Correction, type Recommendation, type ChatMsg } from '@/lib/guandan/coach.ts'
 import { ratingDelta, tierOf, goldenLine, clampRating } from '@/lib/guandan/rating.ts'
-import { TYPE_NAMES } from '@/lib/guandan/patterns.ts'
+import { TYPE_NAMES, isBombType } from '@/lib/guandan/patterns.ts'
 import { CardView } from '@/components/CardView'
 import Endgame from '@/pages/Endgame'
 import { trackCards } from '@/lib/guandan/tracker.ts'
@@ -58,7 +58,7 @@ export default function Home() {
   const [summary, setSummary] = useState<HandSummary | null>(null)
   const [quizStep, setQuizStep] = useState(profile.quizDone ? -1 : 0)
   const [quizScore, setQuizScore] = useState(0)
-  const [sortMode, setSortMode] = useState<'rank' | 'suit' | 'group'>('rank')
+  const [sortMode, setSortMode] = useState<'stack' | 'rank' | 'suit' | 'group'>('stack')
   const [customOrder, setCustomOrder] = useState<number[] | null>(null) // 自由理牌顺序（卡牌 id 序列）
   const dragId = useRef<number | null>(null)
   const [chat, setChat] = useState<ChatMsg[]>([])
@@ -74,6 +74,7 @@ export default function Home() {
       const rest = cards.filter((c) => !inOrder.has(c.id)) // 新进贡的牌排在末尾
       return [...ordered, ...rest]
     }
+    if (sortMode === 'stack') return sortCards(cards, level).reverse() // 大牌在左，同点相邻成列
     if (sortMode === 'rank') return sortCards(cards, level)
     if (sortMode === 'suit') {
       return [...cards].sort((a, b) => a.suit - b.suit || a.rank - b.rank)
@@ -85,6 +86,17 @@ export default function Home() {
       const g = (count.get(b.rank) ?? 0) - (count.get(a.rank) ?? 0)
       return g !== 0 ? g : a.rank - b.rank
     })
+  }
+
+  // 按点叠列：把已排序手牌按同点分组成列（输入需同点相邻）
+  const stackColumns = (cards: Card[]): Card[][] => {
+    const cols: Card[][] = []
+    for (const c of cards) {
+      const last = cols[cols.length - 1]
+      if (last && last[0].rank === c.rank) last.push(c)
+      else cols.push([c])
+    }
+    return cols
   }
 
   // 自由理牌：拖拽到目标位置插入
@@ -232,7 +244,9 @@ export default function Home() {
 
   const tier = tierOf(profile.rating)
   const isMyTurn = !!game && game.phase === 'play' && game.currentSeat === 0 && !summary
-  const lastPlayView = game?.roundLog().filter((l) => l.play).slice().reverse() ?? []
+  const lastPlayView = game?.roundLog().slice().reverse() ?? []
+  const myRoundRec = lastPlayView.find((l) => l.seat === 0)
+  const myRoundPlay = myRoundRec?.play ? myRoundRec : undefined // 本轮不出则清空显示
   const tracker = game ? trackCards(game, level) : []
   const opening = game && showOpening ? openingReview(game.hands[0], level) : null
 
@@ -354,41 +368,31 @@ export default function Home() {
             {/* ---------- 牌桌 ---------- */}
             <UICard className="border-neutral-800 bg-emerald-950/40">
               <CardContent className="space-y-3 p-4">
-                {/* 搭档 */}
-                <SeatRow seat={2} game={game} lastPlayView={lastPlayView} />
-                <div className="grid grid-cols-2 gap-3">
-                  <SeatRow seat={3} game={game} lastPlayView={lastPlayView} side />
-                  <SeatRow seat={1} game={game} lastPlayView={lastPlayView} side />
-                </div>
-
-                {/* 中央信息 + 报牌 */}
-                <div className="rounded-lg bg-neutral-900/70 p-3 text-center text-sm">
-                  {tributeLines.length > 0 && (
-                    <div className="mb-1 space-y-0.5">
-                      {tributeLines.map((l, i) => <p key={i} className="text-violet-300">{l}</p>)}
-                    </div>
-                  )}
-                  {game.phase === 'tribute-return' && <p className="text-amber-300">进贡完成，请选择一张牌还贡（≤10 的牌）</p>}
-                  {game.phase === 'play' && (
-                    <p>
-                      轮到 <span className="font-bold text-amber-300">{seatName(game.currentSeat)}</span>
-                      {game.lastPlay && game.lastSeat !== -1 && (
-                        <span className="text-neutral-400">　须压：{seatName(game.lastSeat)} 的 {TYPE_NAMES[game.lastPlay.type]}（{cardLabel(game.lastPlay.cards[0])} 起）</span>
-                      )}
-                      {(!game.lastPlay || game.lastSeat === -1) && <span className="text-neutral-400">　领出任意牌型</span>}
-                    </p>
-                  )}
-                  {game.phase === 'done' && <p className="text-emerald-300">本手结束，查看复盘 →</p>}
-                  {/* 报牌：≤10 张公示 */}
-                  {game.phase === 'play' && (
-                    <div className="mt-1 flex justify-center gap-3">
-                      {[0, 1, 2, 3].filter((s) => game.hands[s].length > 0 && game.hands[s].length <= 10).map((s) => (
-                        <span key={s} className={`rounded-full px-2 py-0.5 text-xs font-bold ${s === 0 ? 'bg-amber-500/20 text-amber-300' : 'bg-rose-500/20 text-rose-300'} animate-pulse`}>
-                          📢 {seatName(s)} 报牌：剩 {game.hands[s].length} 张
-                        </span>
-                      ))}
-                    </div>
-                  )}
+                {/* 第一人称牌桌：搭档在上，下家(东)在右，上家(西)在左，逆时针出牌，中央信息 */}
+                <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+                  <div />
+                  <SeatRow seat={2} game={game} lastPlayView={lastPlayView} />
+                  <div />
+                  <SeatRow seat={3} game={game} lastPlayView={lastPlayView} />
+                  <div className="rounded-lg bg-neutral-900/70 p-3 text-center text-sm min-w-[150px] sm:min-w-[220px]">
+                    {tributeLines.length > 0 && (
+                      <div className="mb-1 space-y-0.5">
+                        {tributeLines.map((l, i) => <p key={i} className="text-violet-300">{l}</p>)}
+                      </div>
+                    )}
+                    {game.phase === 'tribute-return' && <p className="text-amber-300">进贡完成，请选择一张牌还贡（≤10 的牌）</p>}
+                    {game.phase === 'play' && (
+                      <p>
+                        轮到 <span className="font-bold text-amber-300">{seatName(game.currentSeat)}</span>
+                        {game.lastPlay && game.lastSeat !== -1 && (
+                          <span className="text-neutral-400">　须压：{seatName(game.lastSeat)} 的 <span className={isBombType(game.lastPlay.type) ? 'bomb-flash' : ''}>{TYPE_NAMES[game.lastPlay.type]}{isBombType(game.lastPlay.type) ? ' 💥' : ''}</span>（{cardLabel(game.lastPlay.cards[0])} 起）</span>
+                        )}
+                        {(!game.lastPlay || game.lastSeat === -1) && <span className="text-neutral-400">　领出任意牌型</span>}
+                      </p>
+                    )}
+                    {game.phase === 'done' && <p className="text-emerald-300">本手结束，查看复盘 →</p>}
+                  </div>
+                  <SeatRow seat={1} game={game} lastPlayView={lastPlayView} />
                 </div>
 
                 {/* 玩家手牌 + 理牌 */}
@@ -397,7 +401,7 @@ export default function Home() {
                     <span>你的手牌（{game.hands[0].length} 张）</span>
                     {isMyTurn && <Badge className="bg-amber-500 text-neutral-950">轮到你</Badge>}
                     <span className="ml-auto flex gap-1">
-                      {([['rank', '按大小'], ['suit', '按花色'], ['group', '按牌型']] as const).map(([m, label]) => (
+                      {([['stack', '按点叠列'], ['rank', '按大小'], ['suit', '按花色'], ['group', '按牌型']] as const).map(([m, label]) => (
                         <button key={m}
                           onClick={() => { setSortMode(m); setCustomOrder(null) }}
                           className={`rounded px-2 py-0.5 text-xs ${sortMode === m && !customOrder ? 'bg-amber-500 text-neutral-950 font-bold' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}>
@@ -407,20 +411,44 @@ export default function Home() {
                       <span className="self-center text-xs text-neutral-500">🖐 拖动牌可自由理牌{customOrder ? '（已自定义）' : ''}</span>
                     </span>
                   </div>
-                  <div className="flex flex-wrap gap-1 sm:gap-1.5 rounded-lg bg-neutral-900/70 p-2 sm:p-3 min-h-[96px]">
-                    {sortedHand(game.hands[0]).map((c) => (
+                  {myRoundPlay && (
+                    <p className="mb-1 text-center text-xs text-neutral-400">
+                      你本轮出了：<span className={`font-medium ${myRoundPlay.isBomb ? 'bomb-flash' : 'text-amber-300'}`}>{String(myRoundPlay.label)}{myRoundPlay.isBomb ? ' 💥' : ''}</span>
+                    </p>
+                  )}
+                  {(() => {
+                    const hand = sortedHand(game.hands[0])
+                    const canPick = game.phase === 'tribute-return' || isMyTurn
+                    const renderCard = (c: Card, extra = '') => (
                       <span key={c.id}
                         draggable={game.phase === 'tribute-return' || isMyTurn || game.phase === 'play'}
                         onDragStart={() => { dragId.current = c.id }}
                         onDragOver={(e) => e.preventDefault()}
                         onDrop={() => handleDrop(c.id)}
-                        className="inline-block">
+                        className={`inline-block ${extra}`}>
                         <CardView c={c} selected={selected.has(c.id)}
                           wild={c.suit === 1 && c.rank === level}
-                          onClick={game.phase === 'tribute-return' || isMyTurn ? () => toggleCard(c) : undefined} />
+                          onClick={canPick ? () => toggleCard(c) : undefined} />
                       </span>
-                    ))}
-                  </div>
+                    )
+                    if (!customOrder && sortMode === 'stack') {
+                      // 按点叠列：同点一列，列内向上错开只露角标，大牌在左
+                      return (
+                        <div className="flex items-end gap-1 overflow-x-auto rounded-lg bg-neutral-900/70 p-2 sm:p-3 min-h-[96px]">
+                          {stackColumns(hand).map((col) => (
+                            <div key={col[0].rank} className="flex w-10 shrink-0 flex-col sm:w-[50px]">
+                              {col.map((c, i) => renderCard(c, i > 0 ? '-mt-[32px] sm:-mt-[48px]' : ''))}
+                            </div>
+                          ))}
+                        </div>
+                      )
+                    }
+                    return (
+                      <div className="flex flex-wrap gap-1 sm:gap-1.5 rounded-lg bg-neutral-900/70 p-2 sm:p-3 min-h-[96px]">
+                        {hand.map((c) => renderCard(c))}
+                      </div>
+                    )
+                  })()}
                   <div className="mt-3 flex flex-wrap gap-2">
                     {game.phase === 'tribute-return' ? (
                       <Button disabled={selected.size !== 1} onClick={() => {
@@ -656,25 +684,33 @@ export default function Home() {
   )
 }
 
-function SeatRow({ seat, game, lastPlayView, side }: {
-  seat: number; game: GuandanHand; lastPlayView: { seat: number; label: string; play: unknown }[]; side?: boolean
+function SeatRow({ seat, game, lastPlayView }: {
+  seat: number; game: GuandanHand; lastPlayView: { seat: number; label: string; play: unknown; isBomb?: boolean }[]
 }) {
   const active = game.phase === 'play' && game.currentSeat === seat
   const lastPlay = lastPlayView.find((l) => l.seat === seat)
   const finishedPos = game.finished.indexOf(seat)
+  const avatarText = seat === 2 ? '友' : seatName(seat).slice(0, 1)
   return (
-    <div className={`rounded-lg border p-2 text-sm ${active ? 'border-amber-400 bg-amber-950/30' : 'border-neutral-700 bg-neutral-900/60'} ${side ? '' : ''}`}>
-      <div className="flex items-center gap-2">
+    <div className={`flex flex-col items-center gap-1 rounded-lg border p-2 text-center text-sm ${active ? 'border-amber-400 bg-amber-950/30' : 'border-neutral-700 bg-neutral-900/60'}`}>
+      <div className="flex items-center gap-1.5">
+        <span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold ${seat === 2 ? 'bg-sky-700 text-sky-100' : 'bg-rose-800 text-rose-100'}`}>{avatarText}</span>
         <span className="font-medium">{seatName(seat)}</span>
         {game.hands[seat].length > 0 && game.hands[seat].length <= 10 ? (
           <Badge className="bg-rose-600 animate-pulse">报 {game.hands[seat].length} 张</Badge>
         ) : (
           <Badge variant="outline">{game.hands[seat].length} 张</Badge>
         )}
+      </div>
+      <div className="flex flex-wrap justify-center gap-1">
         {finishedPos >= 0 && <Badge className="bg-emerald-600">第 {finishedPos + 1} 出完</Badge>}
         {active && <Badge className="bg-amber-500 text-neutral-950">思考中…</Badge>}
       </div>
-      {lastPlay && <p className="mt-1 text-neutral-300">最近出牌：{String(lastPlay.label)}</p>}
+      {lastPlay && !!lastPlay.play && (
+        <p className={`max-w-[160px] break-all text-xs ${lastPlay.isBomb ? 'bomb-flash' : 'text-neutral-300'}`}>
+          本轮：{String(lastPlay.label)}{lastPlay.isBomb ? ' 💥' : ''}
+        </p>
+      )}
     </div>
   )
 }

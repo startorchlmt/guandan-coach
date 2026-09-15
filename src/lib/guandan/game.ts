@@ -2,7 +2,7 @@
  * 掼蛋军师 · 对局状态机
  * 一手牌（Game）+ 整局升级（Match）两层。规则口径见需求方案第 3 节。
  */
-import { buildDeck, shuffle, mulberry32, sortCards, maxCard, cardLabel, cardsLabel } from './cards.ts';
+import { buildDeck, shuffle, mulberry32, sortCards, maxCard, cardLabel, cardsLabel, cmpCard } from './cards.ts';
 import type { Card } from './cards.ts';
 import { analyze, isBombType, TYPE_NAMES } from './patterns.ts';
 import type { Play } from './patterns.ts';
@@ -47,7 +47,7 @@ export interface HandResult {
   doubleDown: boolean;
 }
 
-const SEAT_NAMES = ['你(南)', '西家', '搭档(北)', '东家'] as const;
+const SEAT_NAMES = ['你(南)', '东家', '搭档(北)', '西家'] as const;
 export function seatName(seat: number): string {
   return SEAT_NAMES[seat];
 }
@@ -85,18 +85,11 @@ export class GuandanHand {
   private setupTribute(prev: HandResult) {
     const order = prev.order;
     const head = order[0];
-    const last = order[3];
     const doubleDown = prev.doubleDown;
-    const pairs = doubleDown
-      ? [
-          { giver: order[3], receiver: order[0] },
-          { giver: order[2], receiver: order[1] },
-        ]
-      : [{ giver: last, receiver: head }];
+    const givers = doubleDown ? [order[3], order[2]] : [order[3]];
 
     // 抗贡：败方合计持有两张大王
-    const loserSeats = pairs.map((p) => p.giver);
-    const bigJokers = loserSeats.reduce(
+    const bigJokers = givers.reduce(
       (acc, s) => acc + this.hands[s].filter((c) => c.rank === 16).length,
       0,
     );
@@ -105,30 +98,45 @@ export class GuandanHand {
     const given = new Map<number, Card>();
     const returned = new Map<number, Card>();
     const pendingReturn: number[] = [];
+    let pairs: { giver: number; receiver: number }[] = [];
+    let leadSeat = head; // 抗贡时头游领出
 
     if (!resisted) {
-      for (const { giver, receiver } of pairs) {
+      // 先抽各贡方的最大牌
+      const tributes = givers.map((giver) => {
         const card = maxCard(this.hands[giver], this.level);
         this.hands[giver] = this.hands[giver].filter((c) => c.id !== card.id);
-        this.hands[receiver].push(card);
-        this.hands[receiver] = sortCards(this.hands[receiver], this.level);
-        given.set(giver, card);
+        return { giver, card, receiver: order[0] };
+      });
+      // 双贡分配：头游拿大的、二游拿小的；贡大牌的一方先出牌
+      if (doubleDown) {
+        tributes.sort((a, b) => cmpCard(b.card, a.card, this.level));
+        tributes[0].receiver = order[0];
+        tributes[1].receiver = order[1];
+      }
+      leadSeat = tributes[0].giver; // 单贡：进贡方先出；双贡：贡大牌者先出
+      pairs = tributes.map((t) => ({ giver: t.giver, receiver: t.receiver }));
+
+      for (const t of tributes) {
+        this.hands[t.receiver].push(t.card);
+        this.hands[t.receiver] = sortCards(this.hands[t.receiver], this.level);
+        given.set(t.giver, t.card);
         // 还贡：AI 自动还小牌；玩家（0 号位）由 UI 选择
-        if (receiver === 0) {
-          pendingReturn.push(receiver);
+        if (t.receiver === 0) {
+          pendingReturn.push(t.receiver);
         } else {
-          const back = this.pickReturnCard(receiver);
-          returned.set(receiver, back);
-          this.hands[receiver] = this.hands[receiver].filter((c) => c.id !== back.id);
-          this.hands[giver].push(back);
-          this.hands[giver] = sortCards(this.hands[giver], this.level);
+          const back = this.pickReturnCard(t.receiver);
+          returned.set(t.receiver, back);
+          this.hands[t.receiver] = this.hands[t.receiver].filter((c) => c.id !== back.id);
+          this.hands[t.giver].push(back);
+          this.hands[t.giver] = sortCards(this.hands[t.giver], this.level);
         }
       }
     }
 
     this.tribute = { double: doubleDown, pairs, given, returned, resisted, pendingReturn };
     this.phase = pendingReturn.length > 0 ? 'tribute-return' : 'play';
-    this.currentSeat = head; // 头游领出
+    this.currentSeat = leadSeat;
   }
 
   /** 还贡候选：点数 ≤10 的牌 */
@@ -163,6 +171,17 @@ export class GuandanHand {
   aiContext(seat: number): AiContext {
     const partner = (seat + 2) % 4;
     const opps = [(seat + 1) % 4, (seat + 3) % 4];
+    // 被压者（当前大票持有者）是对手时，给出其剩余张数——用炸口诀盯的是这个人
+    const winner = this.lastSeat;
+    const beatTargetCards = winner >= 0 && winner !== seat && winner !== partner ? this.hands[winner].length : null;
+    // 我之后最近一个在局的对手（防止他轻松跟牌走完）
+    let nextOppCards: number | undefined;
+    for (let k = 1; k <= 3; k++) {
+      const s = (seat + k) % 4;
+      if (s === partner || this.finished.includes(s)) continue;
+      nextOppCards = this.hands[s].length;
+      break;
+    }
     return {
       seat,
       hand: this.hands[seat],
@@ -172,6 +191,8 @@ export class GuandanHand {
       partner,
       oppMinCards: Math.min(...opps.map((s) => this.hands[s].length)),
       partnerCards: this.hands[partner].length,
+      beatTargetCards,
+      nextOppCards,
       rng: this.rng,
     };
   }
@@ -234,6 +255,19 @@ export class GuandanHand {
     }
 
     // 结算
+    // 双下：一队包揽头游二游，立即终局（剩下两家不用再打）
+    if (this.finished.length === 2 && this.finished[0] % 2 === this.finished[1] % 2) {
+      const rest = [0, 1, 2, 3]
+        .filter((s) => !this.finished.includes(s))
+        .sort((a, b) => this.hands[a].length - this.hands[b].length);
+      this.finished.push(...rest);
+      this.highlights.push({
+        turn: this.turn, seat: this.finished[0], kind: 'doublewin', weight: 7,
+        text: `${[0, 2].includes(this.finished[0]) ? '我方' : '对方'}双下！包揽头游二游，本手提前结束`,
+      });
+      this.phase = 'done';
+      return;
+    }
     if (this.finished.length >= 3) {
       const last = [0, 1, 2, 3].find((s) => !this.finished.includes(s))!;
       this.finished.push(last);
@@ -290,8 +324,8 @@ export class GuandanHand {
     const myTeam = [0, 2];
     const headIsMine = myTeam.includes(headSeat);
     const partnerPos = order.indexOf(myTeam.includes(headSeat) ? (headSeat === 0 ? 2 : 0) : 0);
-    // 双下：一队包揽一二名
-    const doubleDown = myTeam.includes(order[0]) && myTeam.includes(order[1]);
+    // 双下：一队包揽一二名（哪队都算，进贡规则中性）
+    const doubleDown = order[0] % 2 === order[1] % 2;
     let myTeamDelta = 0;
     if (headIsMine) {
       myTeamDelta = partnerPos === 1 ? 3 : partnerPos === 2 ? 2 : 1;

@@ -3,7 +3,7 @@
  * - 静态资源（带 hash 的 /assets/）：缓存优先
  * - 页面导航：网络优先，断网回退缓存首页
  */
-const CACHE = 'guandan-coach-v1';
+const CACHE = 'guandan-coach-v2';
 const SCOPE = self.registration.scope; // 兼容子路径部署（GitHub Pages）
 
 self.addEventListener('install', (e) => {

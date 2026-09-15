@@ -5,7 +5,7 @@ import { cardsLabel, isWild } from './cards.ts';
 import type { Card } from './cards.ts';
 import { analyze, beat, TYPE_NAMES, isBombType } from './patterns.ts';
 import type { Play } from './patterns.ts';
-import { decide, scoreChoice, enumerateLeads, enumerateResponses, enumerateBombs, analyzeHand } from './ai.ts';
+import { decide, scoreChoice, enumerateLeads, enumerateResponses, enumerateBombs, analyzeHand, breaksBombStructure } from './ai.ts';
 import type { AiContext } from './ai.ts';
 import type { GuandanHand, Highlight } from './game.ts';
 
@@ -91,6 +91,14 @@ export function evaluate(hand: GuandanHand, seat: number, cards: Card[] | null):
     return { verdict: 'good', message: '与教练推荐一致，好棋！' };
   }
   if (gap <= 0.5) return { verdict: 'good', message: '不错的选择，与推荐方案价值相当。' };
+  // 拆炸预警：拆散炸弹/同花顺结构的选择，给出明确警告
+  if (breaksBombStructure(play, ctx.hand, ctx.level)) {
+    return {
+      verdict: gap > 6 ? 'blunder' : 'suboptimal',
+      message: `⚠️ 这手会拆散你手里的炸弹/同花顺结构，太亏了！${top.play ? `建议改为 ${cardsLabel(top.play.cards)}——${top.reason}` : '这轮不出更好。'}`,
+      better: top.play ? { play: top.play, label: cardsLabel(top.play.cards), reason: top.reason, score: top.score } : undefined,
+    };
+  }
   if (gap <= 2.5) {
     return { verdict: 'ok', message: `可行，但略亏。${top.play ? `推荐：${cardsLabel(top.play.cards)}（${top.reason}）` : ''}` };
   }

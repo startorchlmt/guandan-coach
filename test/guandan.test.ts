@@ -4,12 +4,12 @@
  */
 import assert from 'node:assert/strict';
 import {
-  buildDeck, isWild, cmpRank, sortCards, maxCard, cardLabel,
+  buildDeck, isWild, cmpRank, cmpCard, sortCards, maxCard, cardLabel,
 } from '../src/lib/guandan/cards.ts';
 import type { Card } from '../src/lib/guandan/cards.ts';
 import { analyze, beat } from '../src/lib/guandan/patterns.ts';
 import type { Play, PlayType } from '../src/lib/guandan/patterns.ts';
-import { enumerateBombs, enumerateLeads, enumerateResponses, decide, scoreChoice } from '../src/lib/guandan/ai.ts';
+import { enumerateBombs, enumerateLeads, enumerateResponses, decide, scoreChoice, breaksBombStructure } from '../src/lib/guandan/ai.ts';
 import { GuandanHand, newMatch, advanceMatch, handLevel } from '../src/lib/guandan/game.ts';
 import type { HandResult } from '../src/lib/guandan/game.ts';
 import { recommend, evaluate, review, QUIZ, quizBonus, openingReview } from '../src/lib/guandan/coach.ts';
@@ -188,9 +188,10 @@ for (let i = 0; i < 20; i++) {
     assert.equal(new Set(g.finished).size, 4, '名次必须 4 个不同座位');
     const res = g.result();
     assert.ok([0, 1, 2, 3].includes(res.headSeat));
-    // 手牌守恒
+    // 手牌守恒（双下提前终局时可能有两家持牌，故统计全部剩余手牌）
     const played = g.log.reduce((a, l) => a + (l.play ? l.play.cards.length : 0), 0);
-    assert.equal(played + g.hands[res.order[3]].length, 108);
+    const remaining = g.hands.reduce((a, h) => a + h.length, 0);
+    assert.equal(played + remaining, 108);
   });
 }
 
@@ -428,6 +429,8 @@ t(105, '军师六问均有针对性回答', async () => {
 t(106, '剩 9+大王 时必须先出大王锁出牌权', () => {
   const g = new GuandanHand(777, L, null);
   g.hands[0] = handOf([9], [16]); // 单9 + 大王
+  g.hands[1] = handOf([5], [6], [7]); // 下家 3 张
+  g.hands[3] = handOf([12]); // 上家只剩 1 张（对应真实牌局场景：对方一家 3 张一家 1 张）
   g.currentSeat = 0;
   g.phase = 'play';
   const ctx = g.aiContext(0);
@@ -575,14 +578,26 @@ t(121, '残局难度分级：三档生成均唯一解且规模合规', () => {
   assert.equal(diffOfSolved(0), 'easy');
   assert.equal(diffOfSolved(3), 'mid');
   assert.equal(diffOfSolved(8), 'hard');
-  const cases: [Difficulty, number, number][] = [['easy', 2, 3], ['mid', 3, 4], ['hard', 4, 6]];
+  const cases: [Difficulty, number, number][] = [['easy', 3, 4], ['mid', 4, 6], ['hard', 6, 10]];
   for (const [d, lo, hi] of cases) {
     const pz = genPuzzleD(20260900 + d.length * 77, 9, d);
     assert.ok(pz, `${d} 档应能生成残局`);
-    assert.ok(pz!.hands[0].length >= lo && pz!.hands[0].length <= hi, `${d} 档南家张数应在 ${lo}-${hi}`);
+    assert.ok(pz!.hands[0].length >= lo && pz!.hands[0].length <= hi, `${d} 档南家张数应在 ${lo}-${hi}，实际 ${pz!.hands[0].length}`);
     const s = initialState(pz!.hands, pz!.level);
     assert.equal(winningMoves(s).length, 1, `${d} 档首着必须唯一`);
   }
+  // 高手档：随机级牌 + 逢人配必入局
+  const levels = new Set<number>();
+  for (let k = 0; k < 5; k++) {
+    const pz = genPuzzleD(31337 + k * 101, 9, 'hard');
+    assert.ok(pz, `高手档 seed=${31337 + k * 101} 应能生成`);
+    levels.add(pz!.level);
+    assert.ok(
+      pz!.hands.some((h) => h.some((card) => card.suit === 1 && card.rank === pz!.level)),
+      '高手档必须有逢人配（红桃级牌）入局',
+    );
+  }
+  assert.ok(levels.size >= 2, '高手档级牌应随机变化');
 });
 
 t(122, '记牌器：已出+我手扣减，级牌重叠跳过', () => {
@@ -672,6 +687,145 @@ t(126, '开牌点评：强牌给进攻策略、弱牌给辅助策略、逢人配
   const withWild = handOf([5, 1], [6], [7], [8], [9], [9, 1], [9, 2], [10], [11], [12], [13], [14], [2], [3], [4], [5], [6, 1], [7, 1], [8, 1], [10, 1], [11, 1], [12, 1], [13, 1], [14, 1], [2, 1], [3, 1], [4, 1]);
   const r3 = openingReview(withWild, 5); // 打 5：♥5 是逢人配
   assert.ok(r3.lines.some((l) => l.includes('逢人配')), '有逢人配必须给出用法建议');
+});
+
+t(127, '三带二不拆炸弹组：4个8+3个7 不推荐 77788', () => {
+  const hand = handOf([8], [8, 1], [8, 2], [8, 3], [7], [7, 1], [7, 2], [5], [9], [11], [13], [3, 2], [4, 2], [6, 2]); // 打10
+  const leads = enumerateLeads(hand, 10);
+  const bad = leads.find((p) => p.type === 'fullhouse' && p.cards.some((card) => card.rank === 8));
+  assert.ok(!bad, '领出候选中不应出现拆 8 炸弹的三带二');
+  const d = decide({ seat: 0, hand, level: 10, toBeat: null, trickWinner: null, partner: 2, oppMinCards: 20, partnerCards: 20 });
+  assert.ok(d.play);
+  assert.ok(!(d.play!.type === 'fullhouse' && d.play!.cards.some((card) => card.rank === 8)), '主推不应拆炸');
+});
+
+t(128, '领出不拆同花顺：逢人配替补的同花顺受保护且军师会提醒', () => {
+  // 打5：♥5 逢人配 + ♠6♠7♠8♠9 组成黑桃同花顺 6-10；另有对3对Q对K可出
+  const hand = handOf([5, 1], [6, 0], [7, 0], [8, 0], [9, 0], [13], [13, 1], [12], [12, 1], [3, 2], [3, 1]);
+  const sfIds = new Set(hand.slice(0, 5).map((card) => card.id));
+  // 确认引擎能识别这手同花顺
+  assert.ok(enumerateBombs(hand, 5).some((b) => b.type === 'straightflush'), '应识别出同花顺');
+  const d = decide({ seat: 0, hand, level: 5, toBeat: null, trickWinner: null, partner: 2, oppMinCards: 20, partnerCards: 20 });
+  assert.ok(d.play);
+  assert.ok(!d.play!.cards.some((card) => sfIds.has(card.id)), `不应拆同花顺，实际: ${d.play!.cards.map(cardLabel).join(' ')}`);
+  assert.ok(d.reason.includes('同花顺'), '军师话术应提醒保留同花顺');
+});
+
+t(129, 'breaksBombStructure：拆炸判定准确', () => {
+  const hand = handOf([8], [8, 1], [8, 2], [8, 3], [7], [7, 1], [7, 2]);
+  const fh = analyze([hand[4], hand[5], hand[6], hand[0], hand[1]], 10)!; // 77788 拆 8 炸
+  assert.equal(fh.type, 'fullhouse');
+  assert.ok(breaksBombStructure(fh, hand, 10), '77788 应判为拆炸');
+  const bomb = analyze([hand[0], hand[1], hand[2], hand[3]], 10)!;
+  assert.ok(!breaksBombStructure(bomb, hand, 10), '整炸打出不算拆');
+  const triple7 = analyze([hand[4], hand[5], hand[6]], 10)!;
+  assert.ok(!breaksBombStructure(triple7, hand, 10), '纯三同不拆炸');
+});
+
+t(130, '用炸口诀盯「被压者」而非对手最少张数', () => {
+  // 我是 0 号位；上家(3)出对A且还剩 8 张（口诀：炸七不炸八）；下家(1)只剩 3 张但不是拦截目标
+  const hand = handOf([4], [4, 1], [4, 2], [4, 3], [9], [10], [11], [12]); // 只有 4 炸弹能压对A
+  const toBeat = analyze(handOf([14], [14, 1]), 7)!;
+  const d = decide({ seat: 0, hand, level: 7, toBeat, trickWinner: 3, partner: 2, oppMinCards: 3, partnerCards: 10, beatTargetCards: 8, nextOppCards: 3 });
+  assert.equal(d.play, null, `被压者报 8 张不应动炸（旧逻辑会盯着下家的 3 张误判），实际: ${d.play ? d.play.cards.map(cardLabel).join(' ') : '不出'}`);
+  // 同一局面但被压者只剩 5 张（炸五窗口）→ 应炸
+  const d2 = decide({ seat: 0, hand, level: 7, toBeat, trickWinner: 3, partner: 2, oppMinCards: 5, partnerCards: 10, beatTargetCards: 5, nextOppCards: 12 });
+  assert.ok(d2.play && d2.play.type === 'bomb', `被压者报 5 张应用炸: ${d2.reason}`);
+});
+
+t(131, '双下立即终局：我方包揽一二名后不再继续', () => {
+  const g = new GuandanHand(42, 5, null);
+  g.hands = [handOf([3]), handOf([6], [9]), handOf([14]), handOf([10], [11])];
+  g.currentSeat = 0; g.phase = 'play';
+  assert.equal(g.play(0, g.hands[0]), null); // 南出 3，头游
+  assert.equal(g.play(1, [g.hands[1][0]]), null); // 西出 6（还剩 9）
+  assert.equal(g.play(2, g.hands[2]), null); // 北出 A 压过，二游 → 双下
+  assert.equal(g.phase, 'done', '双下应立即终局，剩下两家不用打');
+  const res = g.result();
+  assert.equal(res.doubleDown, true);
+  assert.deepEqual(res.order.slice(0, 2), [0, 2]);
+  assert.equal(res.order.length, 4, '剩余两家按余牌排入名次');
+  assert.equal(res.myTeamDelta, 3, '双下升 3 级');
+});
+
+t(132, '对方双下同样判双下（双贡）', () => {
+  const g = new GuandanHand(43, 5, null);
+  g.hands = [handOf([6], [12]), handOf([3]), handOf([9], [12, 1]), handOf([14])];
+  g.currentSeat = 1; g.phase = 'play';
+  g.play(1, g.hands[1]); // 西出 3 头游
+  g.play(2, [g.hands[2][0]]); // 北出 9（还剩 Q）
+  g.play(3, g.hands[3]); // 东出 A 压过二游 → 对方双下
+  assert.equal(g.phase, 'done');
+  const res = g.result();
+  assert.equal(res.doubleDown, true, '对方包揽一二名也是双下（下一手双贡）');
+  assert.equal(res.myTeamDelta, 0);
+});
+
+t(133, '散小单多的时候出小单不被军师误拦', () => {
+  // 打5：手有 3/6/9/10 四张散小单 + 888KK 三带二材料——旧逻辑会拦小单推三带二
+  const g = new GuandanHand(44, 5, null);
+  g.hands[0] = handOf([3], [6], [9], [10], [8], [8, 1], [8, 2], [13], [13, 1]);
+  g.currentSeat = 0; g.phase = 'play';
+  const single6 = [g.hands[0].find((card) => card.rank === 6)!];
+  const corr = evaluate(g, 0, single6);
+  assert.ok(corr.verdict === 'good' || corr.verdict === 'ok', `散小单多时出小单不应被重拦，实际 ${corr.verdict}: ${corr.message}`);
+});
+
+t(134, '需百搭替补的同花顺不硬拦小单，全自然同花顺仍保护', () => {
+  // 打5：♥5 百搭 + ♠6♠7♠8♠9（百搭补 10 成同花顺）
+  const hand = handOf([5, 1], [6, 0], [7, 0], [8, 0], [9, 0], [13], [13, 1], [12], [12, 1], [3, 2], [3, 1]);
+  const single6 = analyze([hand[1]], 5)!;
+  assert.ok(!breaksBombStructure(single6, hand, 5), '潜在同花顺（需百搭）不应硬拦出小单');
+  // 全自然同花顺 ♠6-10 仍受硬保护
+  const hand2 = handOf([6, 0], [7, 0], [8, 0], [9, 0], [10, 0], [13], [13, 1]);
+  const single6b = analyze([hand2[0]], 5)!;
+  assert.ok(breaksBombStructure(single6b, hand2, 5), '全自然同花顺仍应保护');
+});
+
+t(135, '进贡规则：头游拿大、二游拿小、贡大牌者先出', () => {
+  // 双贡：order [1,3,0,2]（西东包揽一二），末游 2 与第三 0 进贡
+  for (let k = 0; k < 30; k++) {
+    const prev: HandResult = { order: [1, 3, 0, 2], myTeamDelta: 0, headSeat: 1, doubleDown: true };
+    const g = new GuandanHand(9000 + k, 6, prev);
+    const tr = g.tribute!;
+    assert.ok(tr, '应有进贡');
+    if (tr.resisted) { assert.equal(g.currentSeat, 1, '抗贡后头游领出'); continue; }
+    assert.equal(tr.pairs.length, 2, '双下双贡');
+    const toHead = tr.given.get(tr.pairs.find((p) => p.receiver === 1)!.giver)!;
+    const toSecond = tr.given.get(tr.pairs.find((p) => p.receiver === 3)!.giver)!;
+    assert.ok(cmpCard(toHead, toSecond, 6) >= 0, `头游应拿大牌: ${cardLabel(toHead)} vs ${cardLabel(toSecond)}`);
+    const bigGiver = tr.pairs.find((p) => p.receiver === 1)!.giver;
+    assert.equal(g.currentSeat, bigGiver, '贡大牌的一方先出牌');
+  }
+  // 单贡：末游 → 头游，进贡方先出
+  for (let k = 0; k < 20; k++) {
+    const prev: HandResult = { order: [0, 1, 2, 3], myTeamDelta: 1, headSeat: 0, doubleDown: false };
+    const g = new GuandanHand(7000 + k, 6, prev);
+    const tr = g.tribute!;
+    if (tr.resisted) { assert.equal(g.currentSeat, 0); continue; }
+    assert.equal(tr.pairs.length, 1);
+    assert.equal(tr.pairs[0].giver, 3);
+    assert.equal(tr.pairs[0].receiver, 0);
+    assert.equal(g.currentSeat, 3, '单贡时进贡方（末游）先出牌');
+  }
+});
+
+t(136, '选炸不毁另一个炸：4个3+红桃同花顺时出同花顺，不用百搭凑5个3', () => {
+  // 打7（♥7 百搭）：♠3♥3♣3♦3 + ♥4♥5♥6 + ♥7 → 同花顺 ♥3-7；注意 ♥3 与 4个3 共享
+  const hand = handOf([3, 0], [3, 1], [3, 2], [3, 3], [4, 1], [5, 1], [6, 1], [7, 1], [9, 2], [11, 2]);
+  assert.ok(enumerateBombs(hand, 7).some((b) => b.type === 'straightflush'), '应识别红桃同花顺');
+  const toBeat = analyze(handOf([9], [9, 1], [9, 2], [9, 3]), 7)!; // 4个9 炸弹
+  const d = decide({ seat: 0, hand, level: 7, toBeat, trickWinner: 3, partner: 2, oppMinCards: 6, partnerCards: 10, beatTargetCards: 6 });
+  assert.ok(d.play, '应有压牌方案');
+  assert.equal(d.play!.type, 'straightflush', `应出同花顺（保住 3 个 3 的三同），而不是用百搭凑 5 个 3 把同花顺拆成散牌，实际: ${d.play!.cards.map(cardLabel).join(' ')}`);
+});
+
+t(137, '剩两单张：对手剩1张先出大，对手牌多先出小', () => {
+  const mk = (oppMin: number) => ({ seat: 0, hand: handOf([16], [6]), level: 7, toBeat: null as Play | null, trickWinner: null, partner: 2, oppMinCards: oppMin, partnerCards: 8 });
+  const d1 = decide(mk(1));
+  assert.ok(d1.play && d1.play.cards[0].rank === 16, `对手只剩 1 张必须先出大王锁死，实际: ${d1.play?.cards.map(cardLabel).join(' ')}`);
+  const d5 = decide(mk(5));
+  assert.ok(d5.play && d5.play.cards[0].rank === 6, `对手牌还多应先出小单探路，实际: ${d5.play?.cards.map(cardLabel).join(' ')}`);
 });
 
 // ---------- 汇总 ----------

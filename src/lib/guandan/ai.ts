@@ -2,7 +2,7 @@
  * 掼蛋军师 · AI 出牌搜索与启发式决策
  * AI 与教练共用同一套候选枚举 + 评分，保证「推荐方案 = AI 认为的最优打法」。
  */
-import { isWild, isJoker, cmpRank } from './cards.ts';
+import { isWild, isJoker, cmpRank, cardsLabel } from './cards.ts';
 import type { Card } from './cards.ts';
 import { analyze, beat, isBombType, TYPE_NAMES } from './patterns.ts';
 import type { Play } from './patterns.ts';
@@ -130,13 +130,16 @@ export function enumerateLeads(hand: Card[], level: number): Play[] {
   for (const w of windows(3)) push(buildWindow(hs, w, 2));
   for (const w of windows(2)) push(buildWindow(hs, w, 3));
 
-  // 三带二：三条 + 最小对子
+  // 三带二：三条 + 最小对子（残局外不拆 4 张以上的炸弹组）
   const ranksByCount = [...hs.byRank.entries()].sort((a, b) => a[0] - b[0]);
+  const bombRanksL = new Set([...hs.byRank.entries()].filter(([, cs]) => cs.length >= 4).map(([r]) => r));
   for (const [t] of ranksByCount) {
+    if (!endgame && bombRanksL.has(t)) continue; // 三条不能从炸弹组里拆
     const triple = buildSameRank(hs, t, 3);
     if (!triple) continue;
     for (const [p] of ranksByCount) {
       if (p === t) continue;
+      if (!endgame && bombRanksL.has(p)) continue; // 对子也不能从炸弹组里拆（修复"4个8被拆成对子配三带二"）
       const pairCards = (hs.byRank.get(p) ?? []).slice(0, 2);
       if (pairCards.length === 2) push([...triple, ...pairCards]);
     }
@@ -261,7 +264,43 @@ function bombOrder(p: Play): number {
   return p.length <= 4 ? 1 : p.length === 5 ? 2 : p.length - 2;
 }
 
+/**
+ * 该出牌是否拆散炸弹结构（非炸弹牌型部分使用了炸弹组件）：
+ * - 4 张以上同点组被部分消耗
+ * - 同花顺（含逢人配替补的）的任意一张被挪用
+ * 教练评分/AI 决策统一用它惩罚「拆炸」行为。
+ */
+export function breaksBombStructure(play: Play, hand: Card[], level: number): boolean {
+  if (isBombType(play.type)) return false;
+  const ids = new Set(play.cards.map((c) => c.id));
+  const hs = analyzeHand(hand, level);
+  for (const [, cs] of hs.byRank) {
+    if (cs.length >= 4 && cs.some((c) => ids.has(c.id))) return true;
+  }
+  // 同花顺保护只限「全自然」同花顺；需要百搭替补的属于潜在组合，不硬拦（避免误伤出小单）
+  for (const b of enumerateBombs(hand, level)) {
+    if (b.type === 'straightflush'
+      && !b.cards.some((c) => isWild(c, level))
+      && b.cards.some((c) => ids.has(c.id))) return true;
+  }
+  return false;
+}
+
 // ---------- 决策 ----------
+
+/**
+ * 软保护：出牌挪用了「需要百搭替补的同花顺」的组件。
+ * 不硬拦（避免误伤出小单），但 AI 自己决策时减分避让。
+ */
+export function usesWildSfCard(play: Play, hand: Card[], level: number): boolean {
+  if (isBombType(play.type)) return false;
+  const ids = new Set(play.cards.map((c) => c.id));
+  return enumerateBombs(hand, level).some(
+    (b) => b.type === 'straightflush'
+      && b.cards.some((c) => isWild(c, level))
+      && b.cards.some((c) => ids.has(c.id)),
+  );
+}
 
 export interface AiContext {
   seat: number;
@@ -272,6 +311,8 @@ export interface AiContext {
   partner: number;
   oppMinCards: number; // 对手方最少剩余张数
   partnerCards: number; // 搭档剩余张数（中局配合策略用）
+  beatTargetCards?: number | null; // 被压者（当前大票的持有者，非搭档）的剩余张数——用炸口诀盯的是这个人
+  nextOppCards?: number; // 我之后最近一个在局对手的剩余张数（防止他轻松跟牌走完）
   rng?: () => number; // 同分候选随机选择（增加打法多样性）
 }
 
@@ -314,8 +355,13 @@ export function decide(ctx: AiContext): AiDecision {
       if (hand.length <= 6) s += p.cards.length * 0.8; // 残局快走
       // 前期不轻易亮大牌/百搭：手牌多时每点高位扣额外分
       if (hand.length > 12) s -= Math.max(0, cmpRank(p.mainRank, level) - 11) * 0.3;
-      // 剩 2 张的关键残局：必须先出大牌锁死出牌权，否则被对手截走后收不了尾
-      if (hand.length === 2) s += cmpRank(p.mainRank, level) * 0.6;
+      // 剩 2 张的残局：根据对手余牌灵活决定先大还是先小
+      if (hand.length === 2) {
+        const om = ctx.oppMinCards;
+        if (om === 1) s += cmpRank(p.mainRank, level) * 0.6; // 对手只剩 1 张：必须先出大牌锁死，否则他直接垫走
+        else if (om >= 4) s -= cmpRank(p.mainRank, level) * 0.2; // 对手牌还多：先出小单探路，大牌留作后手控制
+        else s += cmpRank(p.mainRank, level) * 0.3; // 对手 2-3 张：仍偏大先出，力度减弱
+      }
       // 中局配合·送桥：搭档濒临出完且轮我领出，出小单/小对送搭档走牌
       if (ctx.partnerCards <= 3 && hand.length > ctx.partnerCards + 2) {
         if (p.type === 'single' && cmpRank(p.mainRank, level) <= 8) s += 4;
@@ -332,11 +378,24 @@ export function decide(ctx: AiContext): AiDecision {
           r !== p.mainRank && cs.length >= unit && cmpRank(r, level) > cmpRank(p.mainRank, level));
         if (!hasBackup && cmpRank(p.mainRank, level) >= 11) s -= 1.2;
       }
+      // 拆炸抑制：拆散全自然同花顺或 4 张同点炸弹组的重罚；拆「百搭同花顺」软惩罚避让
+      if (breaksBombStructure(p, hand, level)) s -= 8;
+      else if (usesWildSfCard(p, hand, level)) s -= 4;
+      // 清小单：手里散小单（≤10 的孤张）≥3 张时，先出小单是正道，攒着反而容易被憋死
+      if (p.type === 'single' && hand.length > 6 && cmpRank(p.mainRank, level) <= 10 && !isWild(p.cards[0], level)) {
+        const looseSingles = [...hs.byRank.entries()].filter(([r, cs]) => cs.length === 1 && r <= 10 && r !== level).length;
+        if (looseSingles >= 3) s += 1.2 * looseSingles;
+      }
       return s;
     };
     const best = pickNearBest(leads, leadScore, 0.4, rng);
     if (!best) return { play: null, score: -999, reason: '无牌可出' };
-    const reason = leadReason(best, hand.length, level, ctx.partnerCards);
+    let reason = leadReason(best, hand.length, level, ctx.partnerCards, ctx.oppMinCards);
+    // 军师话术：手里有同花顺时明确提醒保留
+    const sf = enumerateBombs(hand, level).find((b) => b.type === 'straightflush');
+    if (sf && !best.cards.some((c) => sf.cards.some((x) => x.id === c.id))) {
+      reason += `（注意：你手里有同花顺 ${cardsLabel(sf.cards)}，留住别拆）`;
+    }
     return { play: best, score: leadScore(best), reason };
   }
 
@@ -359,9 +418,28 @@ export function decide(ctx: AiContext): AiDecision {
     return { play: cheapest, score, reason: responseReason(cheapest, level) };
   }
   // 只剩炸弹可压：按口诀「炸九不炸十、炸七不炸八、炸五不炸四、见六就要治」决策
-  const bomb = responses[0];
+  // 选炸原则：火力小的优先，但「会毁掉手里其他炸弹/同花顺」的炸要重罚
+  // （修复：4个3+同花顺时推荐用百搭凑5个3、把同花顺拆成散牌的问题）
+  const bombsBefore = enumerateBombs(hand, level).length;
+  const pickBomb = (cands: Play[]): Play => {
+    let best = cands[0];
+    let bestS = Infinity;
+    for (const b of cands) {
+      const rest = hand.filter((c) => !b.cards.some((x) => x.id === c.id));
+      const restHs = analyzeHand(rest, level);
+      // 毁掉的其他炸弹数 + 剩余散小单数（拆完留一手散牌最差）
+      const destroyed = Math.max(0, bombsBefore - enumerateBombs(rest, level).length);
+      const loose = [...restHs.byRank.entries()].filter(([r, cs]) => cs.length === 1 && r <= 10).length;
+      const s = bombOrder(b) * 2 + destroyed * 3 + loose * 1.5;
+      if (s < bestS) { bestS = s; best = b; }
+    }
+    return best;
+  };
+  const bomb = pickBomb(responses);
   const afterLen = hand.length - bomb.cards.length;
-  const opp = ctx.oppMinCards;
+  // 盯人目标 = 当前被压的那家（大票持有者）；取不到才退化为对手最少张数
+  const opp = ctx.beatTargetCards ?? ctx.oppMinCards;
+  const targetDesc = ctx.beatTargetCards != null ? '对方出牌者' : '对手';
   let worthIt = false;
   let why = '';
   if (afterLen <= 2) {
@@ -372,16 +450,19 @@ export function decide(ctx: AiContext): AiDecision {
     why = '对手动炸，必须以炸还炸，否则出牌权彻底易手';
   } else if (opp <= 3) {
     worthIt = true;
-    why = `对手只剩 ${opp} 张，再不拦就直接走了`;
+    why = `${targetDesc}只剩 ${opp} 张，再不拦就直接走了`;
   } else if (opp === 9 || opp === 7 || opp === 6 || opp === 5) {
     worthIt = true;
-    why = `对手报 ${opp} 张——口诀「${opp === 9 ? '炸九不炸十' : opp === 7 ? '炸七不炸八' : opp === 5 ? '炸五不炸四' : '见六就要治'}」，正是用炸窗口`;
+    why = `${targetDesc}报 ${opp} 张——口诀「${opp === 9 ? '炸九不炸十' : opp === 7 ? '炸七不炸八' : opp === 5 ? '炸五不炸四' : '见六就要治'}」，正是用炸窗口`;
+  } else if (ctx.nextOppCards != null && ctx.nextOppCards <= 2) {
+    worthIt = true;
+    why = `你的下家只剩 ${ctx.nextOppCards} 张，这轮放过去他轻松跟一手就走完了，必须炸停`;
   } else if (opp === 10 || opp === 8) {
-    why = `对手报 ${opp} 张——口诀「${opp === 10 ? '炸九不炸十' : '炸七不炸八'}」：双数报牌常是一手难尽，炸多半拦不死，留炸等更好的时机`;
+    why = `${targetDesc}报 ${opp} 张——口诀「${opp === 10 ? '炸九不炸十' : '炸七不炸八'}」：双数报牌常是一手难尽，炸多半拦不死，留炸等更好的时机`;
   } else if (opp === 4) {
-    why = '对手报 4 张——口诀「炸五不炸四」：4 张常藏着同花顺/炸弹一把走，炸了也白搭，先忍住';
+    why = `${targetDesc}报 4 张——口诀「炸五不炸四」：4 张常藏着同花顺/炸弹一把走，炸了也白搭，先忍住`;
   } else {
-    why = '只有炸弹能压，对手牌数还多，留炸备用';
+    why = '只有炸弹能压，对方出牌者牌数还多，留炸备用';
   }
   if (worthIt) {
     return { play: bomb, score: 3 - bombOrder(bomb), reason: `用${TYPE_NAMES[bomb.type]}夺回出牌权：${why}` };
@@ -389,14 +470,16 @@ export function decide(ctx: AiContext): AiDecision {
   return { play: null, score: 0.5, reason: why };
 }
 
-function leadReason(p: Play, handLen: number, level: number, partnerCards = 99): string {
+function leadReason(p: Play, handLen: number, level: number, partnerCards = 99, oppMin = 99): string {
   if (partnerCards <= 3 && handLen > partnerCards + 2
     && (p.type === 'single' || p.type === 'pair') && cmpRank(p.mainRank, level) <= 8) {
     return `搭档只剩 ${partnerCards} 张：出小${p.type === 'single' ? '单' : '对'}送桥，把走牌机会让给搭档`;
   }
   if (p.cards.length === handLen) return '一把出完，直接取胜';
-  if (handLen === 2 && p.type === 'single' && cmpRank(p.mainRank, level) >= 14) {
-    return '只剩两张：先出最大牌锁死出牌权，下轮收尾，不给对手截胡的机会';
+  if (handLen === 2 && p.type === 'single') {
+    if (oppMin === 1) return '对手只剩 1 张：必须先出大牌锁死出牌权，否则他直接垫牌走人';
+    if (oppMin >= 4 && cmpRank(p.mainRank, level) <= 13) return '对手牌还多：先出小单探路，大牌留作后手控制，两张牌分批走更灵活';
+    if (cmpRank(p.mainRank, level) >= 14) return '只剩两张：先出最大牌锁死出牌权，下轮收尾，不给对手截胡的机会';
   }
   if (p.type === 'single' && cmpRank(p.mainRank, level) <= 8) return '先走小单张探路，保留控制力';
   if (isBombType(p.type)) return '残局用炸弹确保出牌权';
@@ -430,7 +513,12 @@ export function scoreChoice(ctx: AiContext, play: Play | null): number {
     if (['straight', 'pairseq', 'tripleseq', 'fullhouse'].includes(play.type)) s += 1.5;
     if (ctx.hand.length <= 6) s += play.cards.length * 0.8;
     if (ctx.hand.length > 12) s -= Math.max(0, cmpRank(play.mainRank, ctx.level) - 11) * 0.3;
-    if (ctx.hand.length === 2) s += cmpRank(play.mainRank, ctx.level) * 0.6; // 与 decide 同口径：两张残局先大后小
+    if (ctx.hand.length === 2) { // 与 decide 同口径：两单张残局看对手余牌决定先大先小
+      const om = ctx.oppMinCards;
+      if (om === 1) s += cmpRank(play.mainRank, ctx.level) * 0.6;
+      else if (om >= 4) s -= cmpRank(play.mainRank, ctx.level) * 0.2;
+      else s += cmpRank(play.mainRank, ctx.level) * 0.3;
+    }
     if (ctx.partnerCards <= 3 && ctx.hand.length > ctx.partnerCards + 2) { // 送桥
       if (play.type === 'single' && cmpRank(play.mainRank, ctx.level) <= 8) s += 4;
       else if (play.type === 'pair' && cmpRank(play.mainRank, ctx.level) <= 8) s += 2.5;
@@ -445,9 +533,18 @@ export function scoreChoice(ctx: AiContext, play: Play | null): number {
         r !== play.mainRank && cs.length >= unit && cmpRank(r, ctx.level) > cmpRank(play.mainRank, ctx.level));
       if (!hasBackup && cmpRank(play.mainRank, ctx.level) >= 11) s -= 1.2;
     }
+    // 拆炸抑制（与 decide 同口径）：拆同花顺/4张同点组重罚
+    if (breaksBombStructure(play, ctx.hand, ctx.level)) s -= 8;
+    // 清小单（与 decide 同口径）：散小单 ≥3 张时，先出小单是正道
+    if (play.type === 'single' && ctx.hand.length > 6 && cmpRank(play.mainRank, ctx.level) <= 10 && !isWild(play.cards[0], ctx.level)) {
+      const looseSingles = [...hs.byRank.entries()].filter(([r, cs]) => cs.length === 1 && r <= 10 && r !== ctx.level).length;
+      if (looseSingles >= 3) s += 1.2 * looseSingles;
+    }
     return s;
   }
   if (!beat(play, ctx.toBeat, ctx.level)) return -999;
   if (play.cards.length === ctx.hand.length) return 100;
-  return 5 - playCost(play, ctx.level, hs);
+  let rs = 5 - playCost(play, ctx.level, hs);
+  if (breaksBombStructure(play, ctx.hand, ctx.level)) rs -= 8; // 压牌同样不许拆炸
+  return rs;
 }

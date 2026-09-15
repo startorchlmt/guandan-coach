@@ -36,12 +36,22 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-/** 当前座位全部合法着法（含「不出」；领出时必出牌） */
+/** 当前座位全部合法着法（含「不出」；领出时必出牌）。
+ *  战略等价着法去重：牌型+主点+张数+百搭数相同视为同一着（大幅压缩搜索树） */
 export function legalMoves(s: EndState): (Play | null)[] {
   const hand = s.hands[s.seat];
-  if (s.lastSeat === -1 || s.lastSeat === s.seat) return enumerateLeads(hand, s.level);
-  const resp = enumerateResponses(hand, s.level, s.lastPlay!);
-  return [...resp, null];
+  const raw = s.lastSeat === -1 || s.lastSeat === s.seat
+    ? enumerateLeads(hand, s.level)
+    : [...enumerateResponses(hand, s.level, s.lastPlay!), null];
+  const seen = new Set<string>();
+  return raw.filter((m) => {
+    if (m === null) return true;
+    const wildN = m.cards.filter((c) => c.suit === 1 && c.rank === s.level).length;
+    const key = `${m.type}#${m.mainRank}#${m.length}#${wildN}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** 应用一着，返回新局面（头游产生即终局） */
@@ -75,12 +85,17 @@ export function applyMove(s: EndState, m: Play | null): EndState {
   return { hands, seat, lastPlay, lastSeat, passCount, finished, level: s.level };
 }
 
-// ---------- 求解器（minimax + 记忆化） ----------
+// ---------- 求解器（minimax + 记忆化 + 生成期节点预算） ----------
 
 const memo = new Map<string, boolean>();
+let nodes = 0;
+let budgetOn = false; // 仅在生成残局时启用预算，实战对局不受限
+const NODE_CAP = 120_000;
+class SearchOverflow extends Error {}
 
 export function clearSolver(): void {
   memo.clear();
+  nodes = 0;
 }
 
 function keyOf(s: EndState): string {
@@ -95,6 +110,7 @@ export function winTeamA(s: EndState): boolean {
   const key = keyOf(s);
   const hit = memo.get(key);
   if (hit !== undefined) return hit;
+  if (budgetOn && ++nodes > NODE_CAP) throw new SearchOverflow();
   const moves = legalMoves(s);
   const teamA = s.seat % 2 === 0;
   const res = teamA
@@ -173,9 +189,9 @@ export function genPuzzle(seed: number, level: number): Puzzle | null {
 export type Difficulty = 'easy' | 'mid' | 'hard';
 
 export const DIFF_INFO: Record<Difficulty, { name: string; score: number; desc: string }> = {
-  easy: { name: '入门', score: 60, desc: '2-3 张超小残局' },
-  mid: { name: '进阶', score: 100, desc: '3-4 张标准残局' },
-  hard: { name: '高手', score: 160, desc: '4-6 张复杂残局，逢人配入局' },
+  easy: { name: '入门', score: 60, desc: '3-4 张小残局' },
+  mid: { name: '进阶', score: 100, desc: '4-6 张标准残局' },
+  hard: { name: '高手', score: 160, desc: '6-10 张复杂残局，随机级牌含逢人配' },
 };
 
 /** 按已破解数自动升档：0-2 入门，3-7 进阶，8+ 高手 */
@@ -185,33 +201,49 @@ export function diffOfSolved(solved: number): Difficulty {
   return 'easy';
 }
 
-/** 按难度随机生成唯一解残局 */
+/** 按难度随机生成唯一解残局；高手档使用随机级牌且保证逢人配入局 */
 export function genPuzzleD(seed: number, level: number, diff: Difficulty): Puzzle | null {
   const ranges: Record<Difficulty, [number, number][]> = {
-    easy: [[2, 3], [1, 2], [1, 2], [1, 2]],
-    mid: [[3, 4], [2, 3], [2, 3], [2, 3]],
-    hard: [[4, 6], [3, 5], [3, 4], [3, 4]],
+    easy: [[3, 4], [2, 3], [2, 3], [2, 3]],
+    mid: [[4, 6], [3, 4], [3, 4], [3, 4]],
+    hard: [[6, 10], [3, 4], [3, 4], [3, 4]],
   };
   const [r0, r1, r2, r3] = ranges[diff];
-  const rng = mulberry32(seed);
-  const pick = ([lo, hi]: [number, number]) => lo + Math.floor(rng() * (hi - lo + 1));
-  for (let i = 0; i < 400; i++) {
-    const deck = [...buildDeck()];
-    for (let j = deck.length - 1; j > 0; j--) {
-      const k = Math.floor(rng() * (j + 1));
-      [deck[j], deck[k]] = [deck[k], deck[j]];
+  // 外层 3 轮换种子重试，提高高手档出题成功率
+  for (let round = 0; round < 3; round++) {
+    const rng = mulberry32(seed + round * 1000003);
+    const pick = ([lo, hi]: [number, number]) => lo + Math.floor(rng() * (hi - lo + 1));
+    for (let i = 0; i < 400; i++) {
+      // 高手档：随机级牌（2..A），逢人配随之变化
+      const lv = diff === 'hard' ? 2 + Math.floor(rng() * 13) : level;
+      const deck = [...buildDeck()];
+      for (let j = deck.length - 1; j > 0; j--) {
+        const k = Math.floor(rng() * (j + 1));
+        [deck[j], deck[k]] = [deck[k], deck[j]];
+      }
+      const sizes = [pick(r0), pick(r1), pick(r2), pick(r3)];
+      const hands: Card[][] = [];
+      let p = 0;
+      for (const sz of sizes) { hands.push(deck.slice(p, p + sz)); p += sz; }
+      // 高手档：必须有逢人配（红桃级牌）入局
+      if (diff === 'hard' && !hands.some((h) => h.some((c) => c.suit === 1 && c.rank === lv))) continue;
+      const s = initialState(hands, lv);
+      let wm: (Play | null)[];
+      clearSolver(); // 每次尝试重置记忆表与节点计数，防止内存膨胀
+      budgetOn = true;
+      try {
+        wm = winningMoves(s);
+      } catch {
+        continue; // 搜索超限，放弃本次尝试
+      } finally {
+        budgetOn = false;
+      }
+      if (wm.length !== 1 || wm[0] === null) continue;
+      const sol = wm[0];
+      if (sol.cards.length === hands[0].length) continue; // 一把出完太直白
+      if (isBombType(sol.type) && hands[0].length <= 4) continue; // 无脑开炸太直白
+      return { level: lv, hands, solution: sol };
     }
-    const sizes = [pick(r0), pick(r1), pick(r2), pick(r3)];
-    const hands: Card[][] = [];
-    let p = 0;
-    for (const sz of sizes) { hands.push(deck.slice(p, p + sz)); p += sz; }
-    const s = initialState(hands, level);
-    const wm = winningMoves(s);
-    if (wm.length !== 1 || wm[0] === null) continue;
-    const sol = wm[0];
-    if (sol.cards.length === hands[0].length) continue; // 一把出完太直白
-    if (isBombType(sol.type) && hands[0].length <= 4) continue; // 无脑开炸太直白
-    return { level, hands, solution: sol };
   }
   return null;
 }

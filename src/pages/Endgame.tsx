@@ -8,7 +8,7 @@ import { Puzzle as PuzzleIcon, RotateCcw, ArrowLeft, CheckCircle2, XCircle, Minu
 import { CardView } from '@/components/CardView'
 import type { Card } from '@/lib/guandan/cards.ts'
 import { sortCards, cardsLabel, RANK_LABELS } from '@/lib/guandan/cards.ts'
-import { analyze, beat, TYPE_NAMES } from '@/lib/guandan/patterns.ts'
+import { analyze, beat, TYPE_NAMES, isBombType } from '@/lib/guandan/patterns.ts'
 import type { Play } from '@/lib/guandan/patterns.ts'
 import { seatName } from '@/lib/guandan/game.ts'
 import { goldenLine } from '@/lib/guandan/rating.ts'
@@ -48,21 +48,10 @@ export default function Endgame({ onBack }: { onBack: () => void }) {
   const [report, setReport] = useState<LineReport | null>(null)
   const [puzzleNo, setPuzzleNo] = useState(0)
   const [diff, setDiff] = useState<Difficulty>('easy')
+  const [generating, setGenerating] = useState(false)
   const finalized = useRef(false)
 
-  const startPuzzle = (no: number) => {
-    clearSolver()
-    const d = diffOfSolved(eg.solved)
-    let pz: Puzzle | null = null
-    if (no === 0) {
-      pz = CLASSICS[0].puzzle()
-    } else {
-      const seed = Math.floor(Math.random() * 2 ** 31)
-      const level = 2 + Math.floor(Math.random() * 13)
-      pz = genPuzzleD(seed, level, d)
-      if (!pz) pz = CLASSICS[no % CLASSICS.length].puzzle()
-    }
-    setDiff(d)
+  const applyPuzzle = (pz: Puzzle, no: number) => {
     setPuzzle(pz)
     setSt(initialState(pz.hands.map((h) => [...h]), pz.level))
     setRecords([])
@@ -72,7 +61,26 @@ export default function Endgame({ onBack }: { onBack: () => void }) {
     setPuzzleNo(no)
   }
 
-  if (!puzzle || !st) startPuzzle(puzzleNo)
+  const startPuzzle = (no: number) => {
+    clearSolver()
+    const d = diffOfSolved(eg.solved)
+    setDiff(d)
+    if (no === 0) {
+      applyPuzzle(CLASSICS[0].puzzle(), no)
+      return
+    }
+    // 高手档求解量大（手机上可能数秒）：先渲染加载态，再异步出题
+    setGenerating(true)
+    setTimeout(() => {
+      const seed = Math.floor(Math.random() * 2 ** 31)
+      const level = 2 + Math.floor(Math.random() * 13)
+      const pz = genPuzzleD(seed, level, d) ?? CLASSICS[no % CLASSICS.length].puzzle()
+      applyPuzzle(pz, no)
+      setGenerating(false)
+    }, 50)
+  }
+
+  if ((!puzzle || !st) && !generating) startPuzzle(puzzleNo)
 
   // AI 自动行动（对方启发式；搭档走取胜着法）
   useEffect(() => {
@@ -135,6 +143,19 @@ export default function Endgame({ onBack }: { onBack: () => void }) {
 
   const myHand = st ? sortCards(st.hands[0], st.level) : []
   const levelLabel = puzzle ? RANK_LABELS[puzzle.level] : ''
+
+  // 当前轮（三家连续不出后开始新一轮）各家最新一手，用于牌桌方位展示
+  const roundPlays = (() => {
+    const m = new Map<number, MoveRecord>()
+    if (!st) return m
+    let start = 0
+    for (let i = 2; i < records.length; i++) {
+      if (!records[i].play && !records[i - 1].play && !records[i - 2].play) start = i + 1
+    }
+    for (const r of records.slice(start)) m.set(r.seat, r)
+    return m
+  })()
+  const myRoundRec = roundPlays.get(0)
 
   // ---------- 残局战报海报 ----------
   const posterRef = useRef<HTMLCanvasElement | null>(null)
@@ -231,6 +252,11 @@ export default function Endgame({ onBack }: { onBack: () => void }) {
       </header>
 
       <main className="mx-auto max-w-6xl p-4">
+        {generating && (
+          <div className="mb-3 rounded-lg border border-emerald-500/40 bg-emerald-950/60 p-3 text-center text-sm text-emerald-300 animate-pulse">
+            🧩 出题中…{diffOfSolved(eg.solved) === 'hard' ? '高手局计算量较大，请稍候几秒' : '正在寻找唯一正解的残局'}
+          </div>
+        )}
         <div className="grid gap-4 lg:grid-cols-[1fr_340px]">
           {/* ---------- 牌桌 ---------- */}
           <UICard className="border-neutral-800 bg-emerald-950/40">
@@ -247,36 +273,36 @@ export default function Endgame({ onBack }: { onBack: () => void }) {
                 </Button>
               </div>
 
-              {/* 其他三家 */}
-              <div className="grid grid-cols-3 gap-2 text-center text-sm">
-                {[3, 2, 1].map((s) => (
-                  <div key={s} className={`rounded-lg p-2 ${st && st.seat === s && st.finished.length === 0 ? 'bg-amber-500/10 ring-1 ring-amber-500/40' : 'bg-neutral-900/70'}`}>
-                    <p className="text-neutral-300">{seatName(s)}</p>
-                    <p className="text-lg font-bold">{st?.hands[s].length ?? 0} 张</p>
+              {/* 第一人称牌桌：搭档在上，下家在左，上家在右，各家本轮出牌随座显示 */}
+              {st && (
+                <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+                  <div />
+                  <EgSeat seat={2} st={st} rec={roundPlays.get(2)} active={st.seat === 2 && st.finished.length === 0} />
+                  <div />
+                  <EgSeat seat={3} st={st} rec={roundPlays.get(3)} active={st.seat === 3 && st.finished.length === 0} />
+                  {/* 中央状态 */}
+                  <div className="rounded-lg bg-neutral-900/70 p-3 text-center text-sm min-w-[150px] sm:min-w-[220px]">
+                    {st.finished.length === 0 ? (
+                      <p>
+                        轮到 <span className="font-bold text-amber-300">{seatName(st.seat)}</span>
+                        {st.lastPlay && st.lastSeat !== -1 && st.lastSeat !== st.seat
+                          ? <span className="text-neutral-400">　须压：{seatName(st.lastSeat)} 的 <span className={isBombType(st.lastPlay.type) ? 'bomb-flash' : ''}>{TYPE_NAMES[st.lastPlay.type]}{isBombType(st.lastPlay.type) ? ' 💥' : ''}</span></span>
+                          : <span className="text-neutral-400">　领出任意牌型</span>}
+                      </p>
+                    ) : (
+                      <p className={report?.solved ? 'text-emerald-300' : 'text-rose-300'}>
+                        {report?.solved ? '🎉 破解成功！' : st.finished[0] % 2 === 0 ? '己方头游，但过程有瑕疵' : '未能破解'}
+                      </p>
+                    )}
+                    {st.lastPlay && st.finished.length === 0 && (
+                      <p className="mt-1 text-xs text-neutral-500">
+                        当前最大：{seatName(st.lastSeat)} 的 {TYPE_NAMES[st.lastPlay.type]}
+                      </p>
+                    )}
                   </div>
-                ))}
-              </div>
-
-              {/* 中央状态 */}
-              <div className="rounded-lg bg-neutral-900/70 p-3 text-center text-sm">
-                {st && st.finished.length === 0 ? (
-                  <p>
-                    轮到 <span className="font-bold text-amber-300">{seatName(st.seat)}</span>
-                    {st.lastPlay && st.lastSeat !== -1 && st.lastSeat !== st.seat
-                      ? <span className="text-neutral-400">　须压：{seatName(st.lastSeat)} 的 {TYPE_NAMES[st.lastPlay.type]}</span>
-                      : <span className="text-neutral-400">　领出任意牌型</span>}
-                  </p>
-                ) : (
-                  <p className={report?.solved ? 'text-emerald-300' : 'text-rose-300'}>
-                    {report?.solved ? '🎉 破解成功！' : st && st.finished[0] % 2 === 0 ? '己方头游，但过程有瑕疵' : '未能破解'}
-                  </p>
-                )}
-                {st?.lastPlay && st.finished.length === 0 && (
-                  <p className="mt-1 text-xs text-neutral-500">
-                    当前最大：{seatName(st.lastSeat)} 的 {TYPE_NAMES[st.lastPlay.type]}
-                  </p>
-                )}
-              </div>
+                  <EgSeat seat={1} st={st} rec={roundPlays.get(1)} active={st.seat === 1 && st.finished.length === 0} />
+                </div>
+              )}
 
               {/* 玩家手牌 */}
               <div>
@@ -284,6 +310,11 @@ export default function Endgame({ onBack }: { onBack: () => void }) {
                   <span>你的手牌（{st?.hands[0].length ?? 0} 张）</span>
                   {isMyTurn && <Badge className="bg-amber-500 text-neutral-950">轮到你</Badge>}
                 </div>
+                {myRoundRec && myRoundRec.play && (
+                  <p className="mb-1 text-center text-xs text-neutral-400">
+                    你本轮出了：<span className={`font-medium ${isBombType(myRoundRec.play.type) ? 'bomb-flash' : 'text-amber-300'}`}>{cardsLabel(myRoundRec.play.cards)}{isBombType(myRoundRec.play.type) ? ' 💥' : ''}</span>
+                  </p>
+                )}
                 <div className="flex min-h-[96px] flex-wrap gap-1.5 rounded-lg bg-neutral-900/70 p-3">
                   {myHand.map((c) => (
                     <CardView key={c.id} c={c} selected={selected.has(c.id)}
@@ -374,6 +405,26 @@ export default function Endgame({ onBack }: { onBack: () => void }) {
           </div>
         </div>
       </main>
+    </div>
+  )
+}
+
+/** 残局牌桌方位座位卡：头像 + 名称 + 剩余张数 + 本轮出牌 */
+function EgSeat({ seat, st, rec, active }: { seat: number; st: EndState; rec?: MoveRecord; active: boolean }) {
+  const avatarText = seat === 2 ? '友' : seatName(seat).slice(0, 1)
+  return (
+    <div className={`flex flex-col items-center gap-1 rounded-lg border p-2 text-center text-sm ${active ? 'border-amber-400 bg-amber-950/30' : 'border-neutral-700 bg-neutral-900/60'}`}>
+      <div className="flex items-center gap-1.5">
+        <span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold ${seat === 2 ? 'bg-sky-700 text-sky-100' : 'bg-rose-800 text-rose-100'}`}>{avatarText}</span>
+        <span className="font-medium">{seatName(seat)}</span>
+        <Badge variant="outline">{st.hands[seat].length} 张</Badge>
+      </div>
+      {active && <Badge className="bg-amber-500 text-neutral-950">思考中…</Badge>}
+      {rec && rec.play && (
+        <p className={`max-w-[160px] break-all text-xs ${isBombType(rec.play.type) ? 'bomb-flash' : 'text-neutral-300'}`}>
+          本轮：{cardsLabel(rec.play.cards)}{isBombType(rec.play.type) ? ' 💥' : ''}
+        </p>
+      )}
     </div>
   )
 }

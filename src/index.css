@@ -73,3 +73,17 @@
     @apply bg-background text-foreground;
   }
 }
+/* 炸弹动效：弹出 + 红光闪烁 */
+@keyframes bomb-pop {
+  0% { transform: scale(0.5); opacity: 0.4; }
+  45% { transform: scale(1.35); opacity: 1; }
+  70% { transform: scale(0.95); }
+  100% { transform: scale(1); }
+}
+.bomb-flash {
+  display: inline-block;
+  animation: bomb-pop 0.55s ease-out;
+  color: #fb7185;
+  font-weight: 800;
+  text-shadow: 0 0 10px rgba(244, 63, 94, 0.75), 0 0 22px rgba(244, 63, 94, 0.4);
+}
